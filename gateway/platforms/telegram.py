@@ -2314,6 +2314,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # (bug #12545). Entities also correctly handle @handles inside URLs, code
         # blocks, and quoted text, where a regex scan would over-match.
         for source_text, entities in _iter_sources():
+            # DEBUG: log every call to see what's actually coming in
+            logger.warning(
+                "[DEBUG _message_mentions_bot] bot_username=%r text=%r entities=%r",
+                bot_username,
+                source_text[:200] if source_text else "",
+                [(getattr(e, "type", ""), getattr(e, "offset", -1), getattr(e, "length", 0)) for e in entities],
+            )
             for entity in entities:
                 entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
                 if entity_type == "mention" and expected:
