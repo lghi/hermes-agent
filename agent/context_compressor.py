@@ -63,6 +63,27 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
+# GA-style character-domain budget constant (~30K chars ≈ 10K CJK tokens / 7.5K English tokens)
+_GA_CONTEXT_BUDGET_CHARS = 30_000
+
+def _ga_chars_to_tokens(text: str) -> int:
+    """GA-style character-domain token estimator.
+
+    GA uses α≈3 chars/token for CJK content and α≈4 for English.
+    This blends both based on CJK character ratio — critical for mixed
+    CJK/English content where naive char/4 under-estimates by 3-6x.
+
+    Used for GA Stage 1 symmetric head-tail truncation of tool outputs
+    and for enforcing the ``_GA_CONTEXT_BUDGET_CHARS`` ceiling.
+    """
+    if not text:
+        return 0
+    cjk_chars = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    total_chars = len(text)
+    cjk_ratio = cjk_chars / total_chars if total_chars > 0 else 0
+    alpha = 3.0 + (1.0 - cjk_ratio) * 1.0  # α=3 pure CJK, α=4 pure English
+    return max(1, round(total_chars / alpha))
+
 
 def _content_text_for_contains(content: Any) -> str:
     """Return a best-effort text view of message content.
@@ -274,14 +295,15 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
 
 
 class ContextCompressor(ContextEngine):
-    """Default context engine — compresses conversation context via lossy summarization.
+    """GA-style context compressor - enforces strict 30K character budget.
 
-    Algorithm:
-      1. Prune old tool results (cheap, no LLM call)
+    GA four-stage pipeline:
+      1. Prune + symmetric head-tail truncate old tool outputs (no LLM call)
       2. Protect head messages (system prompt + first exchange)
-      3. Protect tail messages by token budget (most recent ~20K tokens)
-      4. Summarize middle turns with structured LLM prompt
-      5. On subsequent compactions, iteratively update the previous summary
+      3. GA Stage 3 - whole-block eviction until context fits 30K char budget
+      4. Protect recent tail by token budget
+      5. Summarize middle turns (LLM call)
+      6. Iterative summary update on subsequent compactions
     """
 
     @property
@@ -530,8 +552,19 @@ class ContextCompressor(ContextEngine):
             if len(content) > 200:
                 call_id = msg.get("tool_call_id", "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                summary = _summarize_tool_result(tool_name, tool_args, content)
-                result[i] = {**msg, "content": summary}
+                # GA Stage 1: symmetric head-tail truncation — keep start + end,
+                # drop the middle.  More informative than a 1-line summary alone.
+                # Use GA character-domain estimator (α=3 CJK / α=4 English).
+                summary_tokens = _ga_chars_to_tokens(content)
+                # Target ~1K tokens for the preserved excerpt
+                head_chars = min(len(content), 4000)
+                tail_chars = min(len(content), 1500)
+                if len(content) > head_chars + tail_chars:
+                    preserved = content[:head_chars] + "\n...\n" + content[-tail_chars:]
+                else:
+                    preserved = content
+                summary_short = _summarize_tool_result(tool_name, tool_args, content)
+                result[i] = {**msg, "content": f"{summary_short}\n\n--- GA snippet ---\n{preserved}"}
                 pruned += 1
 
         # Pass 3: Truncate large tool_call arguments in assistant messages
@@ -1121,12 +1154,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
-        Algorithm:
-          1. Prune old tool results (cheap pre-pass, no LLM call)
+        Algorithm (GA-style four-stage pipeline):
+          1. Prune + symmetric truncate old tool results (head+tail, no LLM call)
           2. Protect head messages (system prompt + first exchange)
-          3. Find tail boundary by token budget (~20K tokens of recent context)
-          4. Summarize middle turns with structured LLM prompt
-          5. On re-compression, iteratively update the previous summary
+          3. GA Stage 3 - whole-block eviction by 30K char budget
+          4. Find tail boundary by token budget
+          5. Summarize middle turns with structured LLM prompt
+          6. On re-compression, iteratively update the previous summary
 
         After compression, orphaned tool_call / tool_result pairs are cleaned
         up so the API never receives mismatched IDs.
@@ -1164,6 +1198,36 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # GA Stage 3: whole-block eviction by character budget
+        # GA enforces a strict ~30K character budget.  Walk from the head forward
+        # and drop whole message blocks until we fit within the budget.
+        # This fires on top of the existing token-based pruning.
+        total_chars = 0
+        for msg in messages:
+            content = msg.get("content") or ""
+            if isinstance(content, str):
+                total_chars += len(content)
+        if total_chars > _GA_CONTEXT_BUDGET_CHARS:
+            excess = total_chars - _GA_CONTEXT_BUDGET_CHARS
+            evicted = 0
+            idx = compress_start
+            chars_freed = 0
+            while idx > 0 and chars_freed < excess:
+                msg = messages[idx - 1]
+                c = len((msg.get("content") or ""))
+                messages = messages[:idx - 1] + messages[idx:]
+                chars_freed += c
+                evicted += 1
+                idx -= 1
+            compress_start = max(self.protect_first_n, idx)
+            if not self.quiet_mode:
+                logger.info(
+                    "GA Stage 3 eviction: removed %d message block(s) "
+                    "(%d chars freed, %d total chars now)",
+                    evicted, chars_freed,
+                    sum(len((m.get("content") or "")) for m in messages),
+                )
 
         if compress_start >= compress_end:
             return messages
